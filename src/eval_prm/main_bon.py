@@ -1,10 +1,16 @@
 import os
+import sys
 import argparse
 from tqdm import tqdm
 from collections import defaultdict
 from tabulate import tabulate
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+import torch
+
+# Add root to sys.path (for src imports)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+
 from src.eval_utils.data import load_datasets, save_jsonl, load_jsonl
 from src.eval_utils.grader import math_equal
 from src.eval_utils.parser import parse_ground_truth, extract_and_strip
@@ -37,16 +43,21 @@ def compute_metrics_fn(eval_results, k, agg_method):
     metrics = []
     for dataset, count in dataset_counts.items():
         correct = dataset_correct[dataset]
-        metrics.append({"dataset": dataset, "total": count, "corrcet": correct, "accuracy": correct / count})
+        metrics.append({
+            "dataset": dataset,
+            "total": count,
+            "correct": correct,
+            "accuracy": correct / count
+        })
 
-    average_accuracy = np.mean([float(metric["accuracy"]) for metric in metrics])
+    average_accuracy = np.mean([float(metric["accuracy"]) for metric in metrics]) if metrics else 0.0
     metrics.append({"Average": average_accuracy})
     return metrics
 
 
 # === CLI Arguments ===
 parser = argparse.ArgumentParser()
-parser.add_argument('--model_name_or_path', type=str, default="Qwen/Qwen2.5-Math-1.5B")
+parser.add_argument('--model_name_or_path', type=str, default="Qwen/Qwen2.5-Math-1.5B-Instruct")
 parser.add_argument('--prompt_type', type=str, default="qwen25-math-cot")
 parser.add_argument('--data_name', type=str, default="college_math")
 parser.add_argument('--split', type=str, default="test")
@@ -62,26 +73,58 @@ os.makedirs(output_dir, exist_ok=True)
 print(f"[DEBUG] Using output directory: {output_dir}")
 
 # === Load model & tokenizer ===
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"[INFO] Using device: {device}")
+
 tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, trust_remote_code=True)
-qa_pipeline = pipeline("text-generation", model=model, tokenizer=tokenizer)
+model = AutoModelForCausalLM.from_pretrained(
+    args.model_name_or_path,
+    trust_remote_code=True,
+    device_map="auto",
+    torch_dtype=torch.float16 if device == "cuda" else torch.float32
+)
+qa_pipeline = pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    device_map="auto",
+    torch_dtype=torch.float16 if device == "cuda" else torch.float32
+)
 
 # === Load datasets ===
 datasets = load_datasets([f"{args.data_name}/{args.split}"])
 if args.num_test_sample:
     datasets = datasets[:args.num_test_sample]
 
+print(f"[DEBUG] First sample:\n{datasets[0]}")
+print(f"[DEBUG] Available keys: {list(datasets[0].keys())}")
+
 # === Generate answers ===
 generations = []
 for sample in tqdm(datasets, desc="Generating responses"):
-    prompt = sample["question"]
-    output = qa_pipeline(prompt, max_new_tokens=512, do_sample=False, temperature=args.temperature, top_p=args.top_p)[0]["generated_text"]
+    prompt = next((sample.get(k) for k in ["question", "prompt", "input", "problem"] if sample.get(k)), None)
+    if not prompt:
+        print(f"[WARNING] Skipping malformed sample with keys: {list(sample.keys())}")
+        continue
+
+    try:
+        output = qa_pipeline(
+            prompt,
+            max_new_tokens=512,
+            do_sample=False,
+            temperature=args.temperature,
+            top_p=args.top_p
+        )[0]["generated_text"]
+    except Exception as e:
+        print(f"[ERROR] Pipeline generation failed for prompt: {prompt} — {e}")
+        continue
+
     generations.append({
         "dataset": args.data_name,
         "question": prompt,
         "response": output,
         "pred": extract_and_strip(output, data_name=args.data_name),
-        "gt_ans": parse_ground_truth(sample, args.data_name)[-1]
+        "gt_ans": sample.get("answer") or parse_ground_truth(sample, args.data_name)[-1]
     })
 
 if args.save_outputs:
@@ -91,7 +134,8 @@ if args.save_outputs:
 for gen in generations:
     try:
         gen["correct"] = math_equal(gen["pred"], gen["gt_ans"])
-    except:
+    except Exception as e:
+        print(f"[ERROR] Failed to evaluate: {gen['pred']} vs {gen['gt_ans']} – {e}")
         gen["correct"] = False
 
 save_jsonl(generations, os.path.join(output_dir, "eval_results.jsonl"))
